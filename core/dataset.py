@@ -55,7 +55,19 @@ class Dataset:
         return base.parent / f"{base.stem}_processed"
 
     def resolve_save_path(self) -> Path:
-        return self.save_path if self.save_path is not None else self.default_save_path()
+        if self.save_path is None:
+            return self.default_save_path()
+
+        if self.type == DatasetType.SINGLE_IMAGE:
+            # save_path is a folder chosen via Save As; the caller appends
+            # the filename itself.
+            return self.save_path
+
+        # Folder dataset: save_path is a parent location the user picked
+        # (e.g. Downloads). Nest a subfolder named after the original
+        # dataset inside it, so class/img-mask structure doesn't get
+        # dumped directly into that folder.
+        return self.save_path / f"{self.original_path.name}_processed"
 
 
 class DatasetManager:

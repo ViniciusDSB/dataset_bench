@@ -74,7 +74,22 @@ def _load_with_astropy(path: Path) -> np.ndarray:
     from astropy.io import fits
 
     with fits.open(path) as hdul:
-        return np.array(hdul[0].data)
+        data = None
+        for hdu in hdul:
+            if hdu.data is not None:
+                data = hdu.data
+                break
+
+        if data is None:
+            raise ValueError(f"No image data found in any HDU of: {path}")
+
+        data = np.asarray(data)
+        if data.ndim > 2:
+            # Data cube (e.g. multiple slices/exposures stacked together) --
+            # take the first 2D slice for preview/processing purposes.
+            data = data[0]
+
+        return data
 
 
 def _save_with_astropy(path: Path, data: np.ndarray) -> None:

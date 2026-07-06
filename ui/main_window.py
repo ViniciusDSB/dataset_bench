@@ -10,10 +10,9 @@ from PySide6.QtWidgets import (
     QDoubleSpinBox,
     QFileDialog,
     QFormLayout,
+    QFrame,
     QHBoxLayout,
     QLineEdit,
-    QListWidget,
-    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QSlider,
@@ -22,14 +21,23 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QToolBar,
     QToolButton,
+    QTreeWidget,
+    QTreeWidgetItem,
     QWidget,
 )
 
 from core.dataset import Dataset, DatasetManager, DatasetType
+from core.dataset_io import IMAGE_EXTENSIONS
 from core.image_io import load_image, save_image
 from core.plugin_base import Plugin, PluginRegistry
 from ui.preview_widget import ImagePreviewWidget
 from ui.tab_state import QueuedOp, TabState
+
+# Sidebar tree item data roles: which dataset an item belongs to, and the
+# specific image file it points to. Group nodes (dataset root, class name,
+# img/mask folders) carry no PATH_ROLE and are not directly openable.
+UID_ROLE = Qt.UserRole
+PATH_ROLE = Qt.UserRole + 1
 
 
 class ParamsDialog(QDialog):
@@ -98,7 +106,7 @@ class MainWindow(QMainWindow):
         self.plugin_registry = PluginRegistry()
         self.plugin_registry.discover()
 
-        self._tab_states: dict[int, TabState] = {}  # tab index -> TabState
+        self._tab_states: dict[int, TabState] = {}  # id(preview_widget) -> TabState
 
         self._build_sidebar()
         self._build_tabs()
@@ -108,8 +116,10 @@ class MainWindow(QMainWindow):
     # --- UI construction ---------------------------------------------
 
     def _build_sidebar(self) -> None:
-        self.sidebar = QListWidget()
-        self.sidebar.setMaximumWidth(280)
+        self.sidebar = QTreeWidget()
+        self.sidebar.setHeaderHidden(True)
+        self.sidebar.setMaximumWidth(320)
+        self.sidebar.itemClicked.connect(self._on_sidebar_item_clicked)
         dock = QDockWidget("Datasets", self)
         dock.setWidget(self.sidebar)
         self.addDockWidget(Qt.LeftDockWidgetArea, dock)
@@ -146,19 +156,38 @@ class MainWindow(QMainWindow):
         layout = QHBoxLayout(tab)
         layout.setContentsMargins(6, 4, 6, 4)
 
-        actions = [
+        file_actions = [
             ("Open", self._open_dialog),
+            ("Close Folder", self._close_dataset),
             ("Save", self._save),
             ("Save As", self._save_as),
             ("Reset", self._reset_tab),
             ("Apply to Dataset", self._apply_to_dataset),
         ]
-        for label, handler in actions:
+        for label, handler in file_actions:
             button = QToolButton()
             button.setText(label)
             button.setAutoRaise(True)
             button.clicked.connect(handler)
             layout.addWidget(button)
+
+        separator = QFrame()
+        separator.setFrameShape(QFrame.VLine)
+        separator.setFrameShadow(QFrame.Sunken)
+        layout.addWidget(separator)
+
+        zoom_actions = [
+            ("Zoom In", self._zoom_in),
+            ("Zoom Out", self._zoom_out),
+            ("Reset Zoom", self._zoom_reset),
+        ]
+        for label, handler in zoom_actions:
+            button = QToolButton()
+            button.setText(label)
+            button.setAutoRaise(True)
+            button.clicked.connect(handler)
+            layout.addWidget(button)
+
         layout.addStretch()
         return tab
 
@@ -180,72 +209,183 @@ class MainWindow(QMainWindow):
         choice_box.setWindowTitle("Open")
         choice_box.setText("What would you like to open?")
         file_button = choice_box.addButton("File", QMessageBox.AcceptRole)
-        folder_button = choice_box.addButton("Folder", QMessageBox.AcceptRole)
+        dataset_button = choice_box.addButton("Dataset", QMessageBox.AcceptRole)
         choice_box.addButton(QMessageBox.Cancel)
         choice_box.exec()
 
         clicked = choice_box.clickedButton()
         if clicked is file_button:
             path_str, _ = QFileDialog.getOpenFileName(self, "Open image")
-        elif clicked is folder_button:
+            if not path_str:
+                return
+            self._open_path(Path(path_str), DatasetType.SINGLE_IMAGE)
+
+        elif clicked is dataset_button:
             path_str = QFileDialog.getExistingDirectory(self, "Open dataset folder")
+            if not path_str:
+                return
+            dataset_type = self._ask_dataset_type()
+            if dataset_type is None:
+                return  # user cancelled the type choice
+            self._open_path(Path(path_str), dataset_type)
+
         else:
             return  # Cancel: stop here, don't chain into another dialog
 
-        if not path_str:
-            return  # user cancelled the file/folder picker itself
-        self._open_path(Path(path_str))
+    def _ask_dataset_type(self) -> DatasetType | None:
+        """Classification vs Segmentation is metadata for plugins only --
+        it doesn't affect how the folder is displayed in the sidebar, which
+        always just mirrors the real directory structure."""
+        type_box = QMessageBox(self)
+        type_box.setWindowTitle("Dataset Type")
+        type_box.setText("Is this a classification or segmentation dataset?")
+        classification_button = type_box.addButton(
+            "Classification", QMessageBox.AcceptRole
+        )
+        segmentation_button = type_box.addButton(
+            "Segmentation", QMessageBox.AcceptRole
+        )
+        type_box.addButton(QMessageBox.Cancel)
+        type_box.exec()
 
-    def _open_path(self, path: Path) -> None:
-        dataset_type = self._infer_dataset_type(path)
+        clicked = type_box.clickedButton()
+        if clicked is classification_button:
+            return DatasetType.CLASSIFICATION
+        if clicked is segmentation_button:
+            return DatasetType.SEGMENTATION
+        return None
+
+    def _open_path(self, path: Path, dataset_type: DatasetType) -> None:
         dataset = Dataset(path=path, type=dataset_type)
         self.dataset_manager.add(dataset)
 
-        item = QListWidgetItem(f"{path.name}  [{dataset_type.name}]")
-        item.setData(1000, dataset.uid)
-        self.sidebar.addItem(item)
-
         if dataset_type == DatasetType.SINGLE_IMAGE:
+            item = QTreeWidgetItem([path.name])
+            item.setData(0, UID_ROLE, dataset.uid)
+            item.setData(0, PATH_ROLE, str(path))
+            self.sidebar.addTopLevelItem(item)
             self._open_tab_for_image(dataset, path)
         else:
-            # For folder datasets, opening just registers it; user picks an
-            # image from within it later (sidebar expansion is a follow-up).
+            root_item = QTreeWidgetItem([f"{path.name}  [{dataset_type.name}]"])
+            root_item.setData(0, UID_ROLE, dataset.uid)  # no PATH_ROLE: not directly openable
+            self.sidebar.addTopLevelItem(root_item)
+            self._add_dir_children(root_item, path, dataset)
+            root_item.setExpanded(True)
             self.statusBar().showMessage(
                 f"Loaded {dataset_type.name} dataset at {path}", 5000
             )
 
-    @staticmethod
-    def _infer_dataset_type(path: Path) -> DatasetType:
-        if path.is_file():
-            return DatasetType.SINGLE_IMAGE
-        if (path / "img").is_dir() or (path / "mask").is_dir():
-            return DatasetType.SEGMENTATION
-        return DatasetType.CLASSIFICATION
+    def _add_dir_children(
+        self, parent_item: QTreeWidgetItem, dir_path: Path, dataset: Dataset
+    ) -> None:
+        """Mirrors the real filesystem structure as-is -- folders as group
+        nodes, recognized image files as openable leaves -- regardless of
+        whether the dataset is Classification or Segmentation. That
+        distinction is only consulted by plugins, not by this tree."""
+        for entry in sorted(dir_path.iterdir()):
+            if entry.is_dir():
+                child_item = QTreeWidgetItem([entry.name])
+                parent_item.addChild(child_item)
+                self._add_dir_children(child_item, entry, dataset)
+            elif entry.suffix.lower() in IMAGE_EXTENSIONS:
+                leaf = QTreeWidgetItem([entry.name])
+                leaf.setData(0, UID_ROLE, dataset.uid)
+                leaf.setData(0, PATH_ROLE, str(entry))
+                parent_item.addChild(leaf)
+
+    def _on_sidebar_item_clicked(self, item: QTreeWidgetItem, column: int) -> None:
+        uid = item.data(0, UID_ROLE)
+        path_str = item.data(0, PATH_ROLE)
+        if not uid or not path_str:
+            return  # a group node (dataset root or plain folder), not a file
+
+        dataset = self.dataset_manager.get(uid)
+        if dataset is None:
+            return
+        self._open_tab_for_image(dataset, Path(path_str))
+
+    def _close_dataset(self) -> None:
+        item = self.sidebar.currentItem()
+        if item is None:
+            QMessageBox.information(
+                self, "Close Folder", "Select a dataset in the sidebar first."
+            )
+            return
+
+        # Walk up to the top-level (dataset root) item, in case a nested
+        # folder/file within the dataset was selected instead of the root.
+        while item.parent() is not None:
+            item = item.parent()
+
+        uid = item.data(0, UID_ROLE)
+        if not uid:
+            return
+        dataset = self.dataset_manager.get(uid)
+
+        # Close any open tabs backed by this dataset before dropping it.
+        for i in reversed(range(self.tabs.count())):
+            widget = self.tabs.widget(i)
+            state = self._tab_states.get(id(widget))
+            if state and state.dataset_uid == uid:
+                self._close_tab(i)
+
+        if dataset is not None:
+            self.dataset_manager.remove(uid)
+
+        index = self.sidebar.indexOfTopLevelItem(item)
+        self.sidebar.takeTopLevelItem(index)
+        self.statusBar().showMessage("Closed dataset", 3000)
 
     # --- Tabs -------------------------------------------------------------
 
     def _open_tab_for_image(self, dataset: Dataset, image_path: Path) -> None:
-        state = TabState.create(dataset_uid=dataset.uid, image_path=image_path)
+        existing_index = self._find_tab_index(dataset.uid, image_path)
+        if existing_index is not None:
+            self.tabs.setCurrentIndex(existing_index)
+            return
+
+        try:
+            state = TabState.create(dataset_uid=dataset.uid, image_path=image_path)
+            array = load_image(state.processed_path)
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Open", f"Could not open {image_path.name}:\n{exc}"
+            )
+            return
+
         preview = ImagePreviewWidget()
-        preview.set_array(load_image(state.processed_path))
+        preview.set_array(array)
 
         preview.pixel_hovered.connect(
             lambda x, y, v: self.statusBar().showMessage(f"({x}, {y}): {v}")
         )
         preview.pixel_left.connect(self.statusBar().clearMessage)
+        preview.zoom_changed.connect(
+            lambda z: self.statusBar().showMessage(f"Zoom: {z:.0%}", 2000)
+        )
 
         index = self.tabs.addTab(preview, image_path.name)
-        self._tab_states[index] = state
+        self._tab_states[id(preview)] = state
         self.tabs.setCurrentIndex(index)
 
+    def _find_tab_index(self, dataset_uid: str, image_path: Path) -> int | None:
+        for i in range(self.tabs.count()):
+            widget = self.tabs.widget(i)
+            state = self._tab_states.get(id(widget))
+            if state and state.dataset_uid == dataset_uid and state.image_path == image_path:
+                return i
+        return None
+
     def _close_tab(self, index: int) -> None:
-        state = self._tab_states.pop(index, None)
+        widget = self.tabs.widget(index)
+        state = self._tab_states.pop(id(widget), None)
         if state:
             state.cleanup()
         self.tabs.removeTab(index)
 
     def _current_state(self) -> TabState | None:
-        return self._tab_states.get(self.tabs.currentIndex())
+        widget = self.tabs.currentWidget()
+        return self._tab_states.get(id(widget)) if widget is not None else None
 
     def _current_preview(self) -> ImagePreviewWidget | None:
         return self.tabs.currentWidget()
@@ -296,6 +436,21 @@ class MainWindow(QMainWindow):
         state.reset()
         self._current_preview().set_array(load_image(state.processed_path))
         self.statusBar().showMessage("Reset to loaded image", 3000)
+
+    def _zoom_in(self) -> None:
+        preview = self._current_preview()
+        if preview:
+            preview.zoom_in()
+
+    def _zoom_out(self) -> None:
+        preview = self._current_preview()
+        if preview:
+            preview.zoom_out()
+
+    def _zoom_reset(self) -> None:
+        preview = self._current_preview()
+        if preview:
+            preview.reset_zoom()
 
     # --- Save / Save As / Apply to Dataset --------------------------------
 
@@ -360,15 +515,21 @@ class MainWindow(QMainWindow):
 
         output_path = dataset.resolve_save_path()
         current_input = dataset.path
-        for op in state.queue:
-            plugin = self.plugin_registry.get(op.plugin_name)
-            plugin.run(
-                input_path=current_input,
-                output_path=output_path,
-                dataset_type=dataset.type,
-                **op.params,
+        try:
+            for op in state.queue:
+                plugin = self.plugin_registry.get(op.plugin_name)
+                plugin.run(
+                    input_path=current_input,
+                    output_path=output_path,
+                    dataset_type=dataset.type,
+                    **op.params,
+                )
+                current_input = output_path  # chain subsequent ops onto the result
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Apply to Dataset", f"Failed while applying '{op.plugin_name}':\n{exc}"
             )
-            current_input = output_path  # chain subsequent ops onto the result
+            return
 
         dataset.path = output_path
         self.statusBar().showMessage(f"Applied to dataset -> {output_path}", 5000)

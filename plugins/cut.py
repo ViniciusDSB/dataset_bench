@@ -45,17 +45,17 @@ class CutPlugin(Plugin):
             self._cut_single(input_path, output_path, x_i, x_f, y_i, y_f)
 
         elif dataset_type == DatasetType.CLASSIFICATION:
-            for img_path, class_name in iter_classification(input_path):
-                rel_out = output_path / class_name / img_path.name
-                self._cut_single(img_path, rel_out, x_i, x_f, y_i, y_f)
+            for img_path, _class_name in iter_classification(input_path):
+                rel_path = img_path.relative_to(input_path)
+                self._cut_single(img_path, output_path / rel_path, x_i, x_f, y_i, y_f)
 
         elif dataset_type == DatasetType.SEGMENTATION:
             for img_path, mask_path in iter_segmentation(input_path):
-                rel_out_img = output_path / "img" / img_path.name
-                self._cut_single(img_path, rel_out_img, x_i, x_f, y_i, y_f)
+                rel_img = img_path.relative_to(input_path)
+                self._cut_single(img_path, output_path / rel_img, x_i, x_f, y_i, y_f)
                 if mask_path is not None:
-                    rel_out_mask = output_path / "mask" / mask_path.name
-                    self._cut_single(mask_path, rel_out_mask, x_i, x_f, y_i, y_f)
+                    rel_mask = mask_path.relative_to(input_path)
+                    self._cut_single(mask_path, output_path / rel_mask, x_i, x_f, y_i, y_f)
 
         else:
             raise ValueError(f"Unsupported dataset_type: {dataset_type}")
