@@ -9,11 +9,13 @@ from pathlib import Path
 
 
 class DatasetType(IntEnum):
-    """The three ways DatasetBench knows how to read a dataset."""
+    """The four ways DatasetBench knows how to read a dataset."""
 
     SINGLE_IMAGE = 0     # a single image file
     CLASSIFICATION = 1   # dataset_folder/class_x/.../image...
     SEGMENTATION = 2     # dataset_folder/{img,mask}_folders/.../image...
+    FOLDER = 3           # dataset_folder/.../image... -- plain images, no
+                          # class or img/mask convention at all
 
 
 @dataclass

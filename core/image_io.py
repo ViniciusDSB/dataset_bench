@@ -8,6 +8,7 @@ downstream needs to change once the real per-format logic is filled in.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import numpy as np
@@ -28,18 +29,31 @@ def load_image(path: Path) -> np.ndarray:
 
 
 def save_image(path: Path, data: np.ndarray) -> None:
-    """Save a numpy array to disk, dispatching by extension."""
+    """Save a numpy array to disk, dispatching by extension.
+
+    Writes to a temporary sibling file first and only replaces the real
+    destination once that write fully succeeds. This means a failed save
+    (e.g. an empty array from a bad crop) can never leave a corrupted or
+    truncated file at `path` -- whatever was there before stays intact.
+    """
     suffix = path.suffix.lower()
     path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_name(f"{path.stem}.tmp{path.suffix}")
 
-    if suffix in (".jpg", ".jpeg", ".png"):
-        _save_with_pillow(path, data)
-    elif suffix in (".tif", ".tiff"):
-        _save_with_tifffile(path, data)
-    elif suffix == ".fits":
-        _save_with_astropy(path, data)
+    try:
+        if suffix in (".jpg", ".jpeg", ".png"):
+            _save_with_pillow(tmp_path, data)
+        elif suffix in (".tif", ".tiff"):
+            _save_with_tifffile(tmp_path, data)
+        elif suffix == ".fits":
+            _save_with_astropy(tmp_path, data)
+        else:
+            raise ValueError(f"Unsupported image format: {suffix}")
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
     else:
-        raise ValueError(f"Unsupported image format: {suffix}")
+        os.replace(tmp_path, path)
 
 
 # --- format-specific backends -------------------------------------------

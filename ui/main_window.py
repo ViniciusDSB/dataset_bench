@@ -1,22 +1,18 @@
 from __future__ import annotations
 
+import shutil
 from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QDialog,
-    QDialogButtonBox,
+    QApplication,
     QDockWidget,
-    QDoubleSpinBox,
     QFileDialog,
-    QFormLayout,
     QFrame,
     QHBoxLayout,
-    QLineEdit,
+    QLabel,
     QMainWindow,
     QMessageBox,
-    QSlider,
-    QSpinBox,
     QStatusBar,
     QTabWidget,
     QToolBar,
@@ -29,9 +25,10 @@ from PySide6.QtWidgets import (
 from core.dataset import Dataset, DatasetManager, DatasetType
 from core.dataset_io import IMAGE_EXTENSIONS
 from core.image_io import load_image, save_image
-from core.plugin_base import Plugin, PluginRegistry
+from core.plugin_base import PluginRegistry
+from datasetbenchlib import dialog
 from ui.preview_widget import ImagePreviewWidget
-from ui.tab_state import QueuedOp, TabState
+from ui.tab_state import PROJECT_TMP_DIR, QueuedOp, TabState
 
 # Sidebar tree item data roles: which dataset an item belongs to, and the
 # specific image file it points to. Group nodes (dataset root, class name,
@@ -40,67 +37,13 @@ UID_ROLE = Qt.UserRole
 PATH_ROLE = Qt.UserRole + 1
 
 
-class ParamsDialog(QDialog):
-    """Generic parameter form, built from a plugin's parameters() dict.
-    Any new plugin gets a working dialog for free, no UI code needed.
-
-    Expected parameters() shapes:
-      {"name": ("int", default)}
-      {"name": ("float", default)}
-      {"name": ("slider", min, max, default)}
-      {"name": ("str", default)}   # fallback for anything else
-    """
-
-    def __init__(self, plugin: Plugin, parent: QWidget | None = None) -> None:
-        super().__init__(parent)
-        self.setWindowTitle(plugin.name)
-        self._fields: dict[str, QWidget] = {}
-
-        layout = QFormLayout(self)
-        for pname, spec in plugin.parameters().items():
-            ptype = spec[0]
-            if ptype == "int":
-                default = spec[1] if len(spec) > 1 else 0
-                widget = QSpinBox()
-                widget.setRange(-1_000_000, 1_000_000)
-                widget.setValue(default)
-            elif ptype == "float":
-                default = spec[1] if len(spec) > 1 else 0.0
-                widget = QDoubleSpinBox()
-                widget.setRange(-1_000_000.0, 1_000_000.0)
-                widget.setValue(default)
-            elif ptype == "slider":
-                lo, hi, default = spec[1], spec[2], spec[3]
-                widget = QSlider(Qt.Horizontal)
-                widget.setRange(lo, hi)
-                widget.setValue(default)
-            else:
-                default = spec[1] if len(spec) > 1 else ""
-                widget = QLineEdit(str(default))
-
-            self._fields[pname] = widget
-            layout.addRow(pname, widget)
-
-        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.accepted.connect(self.accept)
-        buttons.rejected.connect(self.reject)
-        layout.addRow(buttons)
-
-    def params(self) -> dict:
-        result = {}
-        for name, widget in self._fields.items():
-            if isinstance(widget, (QSpinBox, QSlider, QDoubleSpinBox)):
-                result[name] = widget.value()
-            elif isinstance(widget, QLineEdit):
-                result[name] = widget.text()
-        return result
-
-
 class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("DatasetBench")
         self.resize(1200, 800)
+
+        self._clear_stale_tmp_dirs()
 
         self.dataset_manager = DatasetManager()
         self.plugin_registry = PluginRegistry()
@@ -111,9 +54,40 @@ class MainWindow(QMainWindow):
         self._build_sidebar()
         self._build_tabs()
         self._build_top_tabs()
-        self.setStatusBar(QStatusBar())
+        self._build_status_bar()
+
+    @staticmethod
+    def _clear_stale_tmp_dirs() -> None:
+        """Every tab's temp workspace normally gets removed when its tab is
+        closed (see _close_tab) or when the app closes normally (see
+        closeEvent). If the app was killed/crashed instead, those folders
+        are orphaned -- nothing in a fresh session can reference them
+        anyway, so it's safe to sweep tmp/ clean on startup."""
+        if not PROJECT_TMP_DIR.is_dir():
+            return
+        for child in PROJECT_TMP_DIR.iterdir():
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+
+    def closeEvent(self, event) -> None:  # noqa: N802 (Qt override)
+        """Clean up every still-open tab's temp workspace when the app
+        closes, not just the ones explicitly closed via their tab's 'x'."""
+        for state in list(self._tab_states.values()):
+            state.cleanup()
+        super().closeEvent(event)
 
     # --- UI construction ---------------------------------------------
+
+    def _build_status_bar(self) -> None:
+        """Action confirmations (Save, Apply to Dataset, errors...) use the
+        status bar's normal message area, on the left, as before. Pixel
+        coordinates/values and zoom get their own permanent label on the
+        right, so hovering the image never wipes out a save confirmation."""
+        status_bar = QStatusBar()
+        self.setStatusBar(status_bar)
+
+        self._pixel_label = QLabel("")
+        status_bar.addPermanentWidget(self._pixel_label)
 
     def _build_sidebar(self) -> None:
         self.sidebar = QTreeWidget()
@@ -208,52 +182,48 @@ class MainWindow(QMainWindow):
         choice_box = QMessageBox(self)
         choice_box.setWindowTitle("Open")
         choice_box.setText("What would you like to open?")
-        file_button = choice_box.addButton("File", QMessageBox.AcceptRole)
-        dataset_button = choice_box.addButton("Dataset", QMessageBox.AcceptRole)
+        image_button = choice_box.addButton("Image", QMessageBox.AcceptRole)
+        folder_button = choice_box.addButton("Folder", QMessageBox.AcceptRole)
+        classification_button = choice_box.addButton(
+            "Classification Dataset", QMessageBox.AcceptRole
+        )
+        segmentation_button = choice_box.addButton(
+            "Segmentation Dataset", QMessageBox.AcceptRole
+        )
         choice_box.addButton(QMessageBox.Cancel)
         choice_box.exec()
 
         clicked = choice_box.clickedButton()
-        if clicked is file_button:
+        if clicked is image_button:
             path_str, _ = QFileDialog.getOpenFileName(self, "Open image")
             if not path_str:
                 return
             self._open_path(Path(path_str), DatasetType.SINGLE_IMAGE)
 
-        elif clicked is dataset_button:
-            path_str = QFileDialog.getExistingDirectory(self, "Open dataset folder")
+        elif clicked is folder_button:
+            path_str = QFileDialog.getExistingDirectory(self, "Open folder of images")
             if not path_str:
                 return
-            dataset_type = self._ask_dataset_type()
-            if dataset_type is None:
-                return  # user cancelled the type choice
-            self._open_path(Path(path_str), dataset_type)
+            self._open_path(Path(path_str), DatasetType.FOLDER)
+
+        elif clicked is classification_button:
+            path_str = QFileDialog.getExistingDirectory(
+                self, "Open classification dataset"
+            )
+            if not path_str:
+                return
+            self._open_path(Path(path_str), DatasetType.CLASSIFICATION)
+
+        elif clicked is segmentation_button:
+            path_str = QFileDialog.getExistingDirectory(
+                self, "Open segmentation dataset"
+            )
+            if not path_str:
+                return
+            self._open_path(Path(path_str), DatasetType.SEGMENTATION)
 
         else:
             return  # Cancel: stop here, don't chain into another dialog
-
-    def _ask_dataset_type(self) -> DatasetType | None:
-        """Classification vs Segmentation is metadata for plugins only --
-        it doesn't affect how the folder is displayed in the sidebar, which
-        always just mirrors the real directory structure."""
-        type_box = QMessageBox(self)
-        type_box.setWindowTitle("Dataset Type")
-        type_box.setText("Is this a classification or segmentation dataset?")
-        classification_button = type_box.addButton(
-            "Classification", QMessageBox.AcceptRole
-        )
-        segmentation_button = type_box.addButton(
-            "Segmentation", QMessageBox.AcceptRole
-        )
-        type_box.addButton(QMessageBox.Cancel)
-        type_box.exec()
-
-        clicked = type_box.clickedButton()
-        if clicked is classification_button:
-            return DatasetType.CLASSIFICATION
-        if clicked is segmentation_button:
-            return DatasetType.SEGMENTATION
-        return None
 
     def _open_path(self, path: Path, dataset_type: DatasetType) -> None:
         dataset = Dataset(path=path, type=dataset_type)
@@ -357,11 +327,11 @@ class MainWindow(QMainWindow):
         preview.set_array(array)
 
         preview.pixel_hovered.connect(
-            lambda x, y, v: self.statusBar().showMessage(f"({x}, {y}): {v}")
+            lambda x, y, v: self._pixel_label.setText(f"({x}, {y}): {v}")
         )
-        preview.pixel_left.connect(self.statusBar().clearMessage)
+        preview.pixel_left.connect(lambda: self._pixel_label.setText(""))
         preview.zoom_changed.connect(
-            lambda z: self.statusBar().showMessage(f"Zoom: {z:.0%}", 2000)
+            lambda z: self._pixel_label.setText(f"Zoom: {z:.0%}")
         )
 
         index = self.tabs.addTab(preview, image_path.name)
@@ -408,26 +378,34 @@ class MainWindow(QMainWindow):
             )
             return
 
-        param_spec = plugin.parameters()
-        if param_spec:
-            dialog = ParamsDialog(plugin, self)
-            if dialog.exec() != QDialog.Accepted:
-                return
-            params = dialog.params()
-        else:
-            params = {}
+        # Interactive session: the plugin's own dialog.write()/request()
+        # calls (inside run()) show real dialogs here, and whatever the
+        # user enters gets recorded for later replay in Apply to Dataset.
+        dialog.start_session(self)
+        succeeded = True
+        try:
+            plugin.run(
+                input_path=state.processed_path,
+                output_path=state.processed_path,
+                dataset_type=DatasetType.SINGLE_IMAGE,
+            )
+        except dialog.PluginCancelled:
+            succeeded = False
+        except Exception as exc:
+            QMessageBox.critical(self, plugin_name, f"'{plugin_name}' failed:\n{exc}")
+            succeeded = False
+        finally:
+            recorded = dialog.end_session()
 
-        plugin.run(
-            input_path=state.processed_path,
-            output_path=state.processed_path,
-            dataset_type=DatasetType.SINGLE_IMAGE,
-            **params,
-        )
-        state.queue.append(QueuedOp(plugin_name=plugin_name, params=params))
-        dataset.metadata[plugin_name] = params  # remembered for "apply to all"
+        if not succeeded:
+            self.statusBar().showMessage(f"{plugin_name} cancelled", 3000)
+            return
+
+        state.queue.append(QueuedOp(plugin_name=plugin_name, recorded_calls=recorded))
+        dataset.metadata[plugin_name] = recorded  # remembered for "apply to all"
 
         self._current_preview().set_array(load_image(state.processed_path))
-        self.statusBar().showMessage(f"Applied {plugin_name}: {params}", 5000)
+        self.statusBar().showMessage(f"Applied {plugin_name}", 7000)
 
     def _reset_tab(self) -> None:
         state = self._current_state()
@@ -461,12 +439,18 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Save As", "Open an image first.")
             return
         dataset = self.dataset_manager.get(state.dataset_uid)
+        self._prompt_save_location(dataset)
 
+    def _prompt_save_location(self, dataset: Dataset) -> bool:
+        """Opens the folder picker and sets dataset.save_path. Returns False
+        if the user cancelled, so callers can abort instead of proceeding
+        with an unconfirmed location."""
         path_str = QFileDialog.getExistingDirectory(self, "Choose save location")
         if not path_str:
-            return
+            return False
         dataset.save_path = Path(path_str)
         self.statusBar().showMessage(f"Save location set to {path_str}", 5000)
+        return True
 
     def _save(self) -> None:
         """Writes the current tab's processed image to the resolved save
@@ -484,9 +468,12 @@ class MainWindow(QMainWindow):
             # original filename inside it.
             output_path = output_path / state.image_path.name
 
+        self.statusBar().showMessage("Processing...")
+        QApplication.processEvents()  # force the message to paint before the blocking save
+
         save_image(output_path, load_image(state.processed_path))
         dataset.path = output_path  # chain further ops onto the saved result
-        self.statusBar().showMessage(f"Saved to {output_path}", 5000)
+        self.statusBar().showMessage(f"Saved to {output_path}", 7000)
 
     def _apply_to_dataset(self) -> None:
         state = self._current_state()
@@ -513,17 +500,28 @@ class MainWindow(QMainWindow):
                 )
                 return
 
+        if dataset.save_path is None:
+            if not self._prompt_save_location(dataset):
+                return  # user cancelled -- don't apply with an unconfirmed location
+
         output_path = dataset.resolve_save_path()
         current_input = dataset.path
+
+        self.statusBar().showMessage("Processing...")
+        QApplication.processEvents()  # force the message to paint before the blocking loop
+
         try:
             for op in state.queue:
                 plugin = self.plugin_registry.get(op.plugin_name)
-                plugin.run(
-                    input_path=current_input,
-                    output_path=output_path,
-                    dataset_type=dataset.type,
-                    **op.params,
-                )
+                dialog.start_session(self, replay=op.recorded_calls)
+                try:
+                    plugin.run(
+                        input_path=current_input,
+                        output_path=output_path,
+                        dataset_type=dataset.type,
+                    )
+                finally:
+                    dialog.end_session()
                 current_input = output_path  # chain subsequent ops onto the result
         except Exception as exc:
             QMessageBox.critical(
@@ -532,4 +530,4 @@ class MainWindow(QMainWindow):
             return
 
         dataset.path = output_path
-        self.statusBar().showMessage(f"Applied to dataset -> {output_path}", 5000)
+        self.statusBar().showMessage(f"Applied to dataset -> {output_path}", 7000)

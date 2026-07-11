@@ -15,7 +15,10 @@ PROJECT_TMP_DIR = Path(__file__).resolve().parent.parent / "tmp"
 @dataclass
 class QueuedOp:
     plugin_name: str
-    params: dict
+    # One dict per dialog.request() call the plugin made during its
+    # interactive run, in order -- replayed (not re-prompted) when this
+    # op is later applied across a whole dataset.
+    recorded_calls: list[dict] = field(default_factory=list)
 
 
 @dataclass

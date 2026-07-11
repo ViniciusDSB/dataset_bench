@@ -38,24 +38,22 @@ class Plugin(ABC):
         input_path: Path,
         output_path: Path,
         dataset_type: DatasetType,
-        **params: Any,
     ) -> ProcessResult:
         """Read from input_path according to dataset_type, apply the
         operation, write the result to output_path.
 
         Used identically whether called once on a temp preview image or
-        iterated by the dataset loader across a full dataset — the plugin
+        iterated by the dataset loader across a full dataset -- the plugin
         itself branches its reading/iteration logic on dataset_type, there
         is no external shared iterator dispatching on its behalf.
+
+        If the plugin needs any parameters from the user, it asks for them
+        itself via `datasetbenchlib.dialog` (write()/request()) at the top
+        of this method, before branching on dataset_type -- DatasetBench
+        replays those same answers automatically when this plugin gets
+        applied across a whole dataset, so it's only ever prompted once.
         """
         raise NotImplementedError
-
-    def parameters(self) -> dict[str, tuple]:
-        """Describes the inputs the UI should render for this plugin.
-        e.g. {"x_i": ("int", 0), "x_f": ("int", 0)}
-        Override in subclasses; empty by default.
-        """
-        return {}
 
     def supports(self, dataset_type: DatasetType) -> bool:
         return dataset_type in self.applies_to

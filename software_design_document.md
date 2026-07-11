@@ -47,13 +47,14 @@ with format-specific logic filled in later without changing plugin code.
 
 ### 3.1 Dataset Types (constants)
 
-Three ways of reading a dataset are supported:
+Four ways of reading a dataset are supported:
 
 | Value | Name | Structure |
 |---|---|---|
 | `0` | `SINGLE_IMAGE` | A single image file |
 | `1` | `CLASSIFICATION` | `dataset_folder/class_x/.../image...` |
 | `2` | `SEGMENTATION` | `dataset_folder/{img,mask}_folders/.../image...` |
+| `3` | `FOLDER` | `dataset_folder/.../image...` — plain images, no class or img/mask convention |
 
 ```python
 from enum import IntEnum
@@ -62,6 +63,7 @@ class DatasetType(IntEnum):
     SINGLE_IMAGE = 0
     CLASSIFICATION = 1
     SEGMENTATION = 2
+    FOLDER = 3
 ```
 
 ### 3.2 `Dataset` object
@@ -107,14 +109,12 @@ runnable on its own (so it can also be copied out and used independently of
 the system), and implements a common interface so the app can discover it
 automatically.
 
-**A plugin receives:**
+**A plugin's `run()` receives:**
 - `input_path` — where to read from
 - `output_path` — where to write results to
-- `dataset_type` — which of the three structures it's reading (the plugin
+- `dataset_type` — which of the four structures it's reading (the plugin
   branches its own iteration/reading logic internally based on this; there
   is no shared external iterator dispatching calls on the plugin's behalf)
-- `**params` — operation-specific parameters (for `Cut`: `x_i, x_f, y_i,
-  y_f`)
 
 ```python
 class Plugin(ABC):
@@ -123,26 +123,93 @@ class Plugin(ABC):
 
     @abstractmethod
     def run(self, input_path: Path, output_path: Path,
-            dataset_type: DatasetType, **params) -> ProcessResult:
+            dataset_type: DatasetType) -> ProcessResult:
         """Reads from input_path according to dataset_type, applies the
         operation, writes result to output_path. Used identically whether
         called on a single temp preview image or iterated across a full
         dataset."""
-
-    def parameters(self) -> dict:
-        """Describes the inputs the UI should render for this plugin,
-        e.g. {"x_i": ("int", 0), "x_f": ("int", 0), ...}"""
 ```
 
-Example (`plugins/cut.py`):
+There is no static parameter schema on the class. If a plugin needs input
+from the user, it asks for it itself, from *inside* `run()`, via
+`datasetbenchlib.dialog` — a small host API the app injects a live session
+into before calling `run()`. This means a plugin's dialogs can be however
+simple or complex it needs (one field, ten fields, several dialogs in
+sequence) without the app needing to know their shape ahead of time — new
+plugins never require any UI code to be written elsewhere.
+
+### 4.1 `datasetbenchlib.dialog` API
+
+```python
+from datasetbenchlib import dialog
+
+dialog.write("Please enter the cut coordinates.")            # optional help text
+values = dialog.request({"x_i": 0, "x_f": 100,                # one call, many fields
+                          "y_i": 0, "y_f": 100})
+x_i, x_f, y_i, y_f = values["x_i"], values["x_f"], values["y_i"], values["y_f"]
+```
+
+- **`write(text)`** queues a line of help text, shown above the fields in
+  the *next* `request()` call. Can be called more than once to build up a
+  short message; cleared after that `request()`.
+- **`request(fields) -> dict`** shows one dialog with one input per
+  `{name: default_value}` entry and blocks until submitted. The widget type
+  is inferred from each default's Python type:
+
+  | Default type | Widget |
+  |---|---|
+  | `bool` | checkbox |
+  | `int` | spin box |
+  | `float` | spin box (decimal) |
+  | `list[(a, b), ...]` | dynamic range list (add/remove rows) |
+  | anything else | text field |
+
+  Raises `dialog.PluginCancelled` if the user cancels — plugins can just
+  let that propagate; the app treats it as a clean abort, not an error.
+
+**Convention:** call every `request()` a plugin needs *before* branching on
+`dataset_type`, at the top of `run()`. This keeps the call count and order
+identical on every invocation, which is what makes the replay mechanism
+below possible.
+
+### 4.2 Why "Apply to Dataset" doesn't re-prompt per file
+
+`run()` gets called once per image when applying to a whole dataset —
+without care, that would mean opening a dialog hundreds of times. Instead,
+the app runs two kinds of session, via `dialog.start_session()` /
+`dialog.end_session()`:
+
+- **Interactive session** (single-image tab, one real invocation): each
+  `request()` shows a real dialog and the answer gets *recorded*.
+  `end_session()` returns everything recorded, in call order.
+- **Replay session** (Apply to Dataset, once per file): `start_session(...,
+  replay=<recorded list>)` means `request()` does **not** show a dialog —
+  it just returns the next recorded answer in sequence.
+
+The app stores the recorded list on the queued operation
+(`QueuedOp.recorded_calls`) and on `dataset.metadata[plugin_name]`, so a
+plugin is only ever prompted once per use, no matter how many files it
+later gets applied to.
+
+### 4.3 Standalone use
+
+If a plugin is run directly (`python plugins/cut.py ...`) with no session
+bound, `request()` falls back to a plain console prompt
+(`x_i [0]: `), so plugins stay fully runnable outside the app.
+
+### 4.4 Example (`plugins/cut.py`)
 
 ```python
 class CutPlugin(Plugin):
     name = "Cut"
     applies_to = [DatasetType.SINGLE_IMAGE, DatasetType.CLASSIFICATION,
-                  DatasetType.SEGMENTATION]
+                  DatasetType.SEGMENTATION, DatasetType.FOLDER]
 
-    def run(self, input_path, output_path, dataset_type, x_i, x_f, y_i, y_f):
+    def run(self, input_path, output_path, dataset_type):
+        dialog.write("Please enter the cut coordinates.")
+        values = dialog.request({"x_i": 0, "x_f": 100, "y_i": 0, "y_f": 100})
+        x_i, x_f, y_i, y_f = values["x_i"], values["x_f"], values["y_i"], values["y_f"]
+
         # dataset_type branches folder-walking logic internally
         # e.g. crop = img[y_i:y_f, x_i:x_f]
         ...
@@ -154,9 +221,9 @@ and enables/disables toolbar actions based on whether `applies_to` matches
 the active tab's dataset type.
 
 `core/dataset_io.py` provides shared read-helpers (`iter_single`,
-`iter_classification`, `iter_segmentation`) — plain file-pairing generators
-with no processing logic — so plugins can reuse folder-walking code instead
-of duplicating it per plugin.
+`iter_images`, `iter_classification`, `iter_segmentation`) — plain
+file-pairing generators with no processing logic — so plugins can reuse
+folder-walking code instead of duplicating it per plugin.
 
 ---
 
@@ -184,13 +251,16 @@ Flow:
 
 1. Click an image in the sidebar → copied to `tmp/<tab_id>/loaded.tiff`,
    also copied to `processed.tiff` initially, and displayed.
-2. Click "Cut" → user enters `x_i, x_f, y_i, y_f`.
+2. Click "Cut" → the plugin's own `dialog.request()` call shows a dialog
+   asking for `x_i, x_f, y_i, y_f`.
 3. Plugin runs: reads `processed.tiff`, writes result back to
    `processed.tiff`. Preview updates.
-4. The operation is appended to an in-memory **queue** for the tab:
+4. The operation is appended to an in-memory **queue** for the tab, along
+   with whatever the plugin's dialog session recorded:
    ```python
-   queue = [{"op": "cut", "params": {"x_i": 264, "x_f": 1720,
-                                      "y_i": 264, "y_f": 1720}}]
+   queue = [QueuedOp(plugin_name="Cut",
+                      recorded_calls=[{"x_i": 264, "x_f": 1720,
+                                        "y_i": 264, "y_f": 1720}])]
    ```
 5. Further operations continue reading/writing `processed.tiff` and append
    to the same queue, in order.
@@ -217,7 +287,10 @@ extra file I/O involved.
 5. Using the appropriate loader for `dataset.type`
    (`SingleImageLoader` / `ClassificationLoader` / `SegmentationLoader`),
    every image in the dataset is processed by replaying the queue's
-   operations in order, via each operation's plugin `run()`.
+   operations in order. For each queued op, the app starts a **replay
+   session** (`dialog.start_session(..., replay=op.recorded_calls)`) so the
+   plugin's `run()` executes exactly as it did interactively, without
+   re-prompting — see §4.2.
 6. Original dataset files are left untouched; the existing dataset folder
    structure (classes/img-mask pairing) is preserved in the output.
 7. After a successful write, `dataset.path` is updated to point at the
@@ -236,8 +309,10 @@ extra file I/O involved.
 
 ## 6. Deferred / Out of Scope (for now)
 
-- Threshold plugin logic (queue/data structure already accommodates it —
-  `{"op": "threshold", "params": {...}}` — implementation to follow later).
+- Threshold plugin logic — the queue/replay mechanism already accommodates
+  it; the ranges themselves will come from `dialog.request({"ranges": [(0,
+  None)]})`, which renders as an add/remove-able list of (low, high) rows
+  (see §4.1).
 - Format conversion between jpg/jpeg/png/tiff/fits (existing scripts to be
   integrated into `core/image_io.py` later).
 - Persisting queues/state across app restarts.
